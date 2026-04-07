@@ -1,0 +1,22 @@
+{
+  "name": "drawio-mcp",
+  "version": "3.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && node dist/scripts/build-oci-catalog.js",
+    "build:catalog": "node dist/scripts/build-oci-catalog.js",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "dependencies": {
+    "@drawio/mcp": "^1.1.8",
+    "fast-xml-parser": "^5.5.10",
+    "pako": "^2.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pako": "^2.0.4",
+    "typescript": "^5.7.0"
+  }
+}
