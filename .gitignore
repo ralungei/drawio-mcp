@@ -1,3 +1,6 @@
 node_modules/
 dist/
 .env
+# Build artifacts regenerated from data/oci-library.xml by scripts/build-oci-catalog.ts
+data/oci-catalog.json
+data/oci-shapes.json

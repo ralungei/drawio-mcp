@@ -1,16 +1,16 @@
 /**
- * Three MCP tools for OCI shape discovery and diagram creation.
+ * Two MCP tools for OCI shape discovery and diagram creation.
  * Handled directly by the wrapper (not forwarded to @drawio/mcp subprocess).
  */
 
-import { getCategories, listShapes, searchShapes } from "./shape-catalog.js";
+import { randomUUID } from "crypto";
+import { getCategories, listShapes } from "./shape-catalog.js";
 import { buildDiagram, type DiagramNode, type DiagramConnection, type DiagramGroup } from "./shape-resolver.js";
-import { getLibraryBaseUrl } from "../url-rewriter.js";
+import { getLibraryBaseUrl, getDiagramParBaseUrl } from "../url-rewriter.js";
 
 // Tool names handled by the wrapper
 export const OCI_TOOL_NAMES = [
-  "list_oci_shapes",
-  "search_oci_shapes",
+  "list_oci_icons",
   "create_oci_diagram",
 ] as const;
 
@@ -20,49 +20,220 @@ export function isOciTool(name: string): name is OciToolName {
   return OCI_TOOL_NAMES.includes(name as OciToolName);
 }
 
+/** Server-level instructions injected into the MCP initialize response.
+ *  Covers cross-tool workflow, domain conventions, and reference data
+ *  shared by every diagram-building interaction. Tool descriptions stay
+ *  narrow (what/when/how for that specific tool). */
+export function getServerInstructions(): string {
+  return `# OCI draw.io diagram server
+
+Build Oracle Cloud Infrastructure architecture diagrams in draw.io format.
+
+## Workflow (always, before building any diagram)
+
+1. Call \`list_oci_icons\` ONCE with all relevant categories as a single array argument. Never multiple calls.
+2. Call \`create_oci_diagram\` with nodes, connections, groups.
+
+Categories: Compute, Networking, Database, Storage, Analytics and AI, Developer Services, Identity and Security, Observability and Management, Applications, Governance and Administration, Migration.
+
+## Shape slug convention
+
+\`category/name\` lowercase with underscores. E.g. \`compute/virtual_machine_vm\`, \`database/autonomous_db\`, \`analytics_and_ai/digital_assistant\`. Never invent — use only slugs returned by \`list_oci_icons\`.
+
+## Icon-first rule (applies to all node choices)
+
+Always prefer an OCI icon over a \`component/*\` box, even if the match is approximate:
+- Exact service → its icon (Autonomous DB → \`database/autonomous_db\`).
+- Sub-component → parent service's icon (Skill/Channel inside ODA → \`analytics_and_ai/digital_assistant\`).
+- Generic category → thematic icon (REST API → \`developer_services/api_service\`; LLM → \`analytics_and_ai/artificial_intelligence\`; Auth → \`identity_and_security/iam_identity_and_access_management\`; any DB → \`database/autonomous_db\`; compute → \`compute/virtual_machine_vm\`).
+- External system → \`networking/customer_premises_equipment_cpe\` or \`customer_data_center\`.
+
+\`component/*\` = last resort for truly abstract concepts (legal wrappers, pricing tiers). Reused approximate icon > plain box.
+
+## Human actors
+
+Users, customers, admins, developers, operators = Identity and Security icons, never component boxes:
+\`identity_and_security/user\` (generic), \`user_1\` (developer), \`user_2\` (admin), \`user_group[_1/_2]\` (multiple). Place inside \`logical/grouping_internet\` for external access.
+
+## Connector annotations — opt-in only
+
+\`step\` and \`note\` fields on a connection are OPT-IN. Default: omit.
+
+Typical diagram: 3-5 user-numbered steps total. Internal service-to-service dataflow gets NO step. Adding step to >5 connections = wrong. If ≥90% of connections have a step, the MCP drops all as placeholder abuse.
+
+## Colors (auto-applied, reference only)
+
+Bark #312D2A, Air #FCFBFA, Sienna #AE562C, Ivy #759C6C, O-Red #C74634, Neutral 1-4.`;
+}
+
 /** Tool definitions to append to tools/list response */
 export function getOciToolDefinitions(): object[] {
   return [
     {
-      name: "list_oci_shapes",
+      name: "list_oci_icons",
       description:
-        "List available OCI (Oracle Cloud Infrastructure) shapes for architecture diagrams. Without a category, returns all categories with counts. With a category, returns all shapes in that category with slug, title, and dimensions.",
+        "List available OCI icon shapes (service icons for the nodes array). Returns icons with slug, title, and dimensions. Grouping shapes for the groups array are already documented in create_oci_diagram.\n\nALWAYS pass ALL needed categories as a single array — NEVER call this tool multiple times with one category each.\n\nCategories: Compute, Networking, Database, Storage, Analytics and AI, Developer Services, Identity and Security, Observability and Management, Applications, Governance and Administration, Migration.",
       inputSchema: {
         type: "object" as const,
         properties: {
           category: {
-            type: "string",
+            type: ["string", "array"],
             description:
-              "Optional category name to filter shapes (e.g. 'Compute', 'Networking', 'Database', 'Storage', 'Identity and Security', 'Logical', 'Physical'). Omit to see all categories.",
+              "REQUIRED. Array of category names to fetch in a single call. Example: ['Compute', 'Networking', 'Database', 'Storage']. NEVER call this tool multiple times — pass all categories at once.",
+            items: { type: "string" },
           },
         },
-      },
-    },
-    {
-      name: "search_oci_shapes",
-      description:
-        "Search OCI shapes by keyword. Returns matching shapes with their slugs for use in create_oci_diagram. Example queries: 'load balancer', 'virtual machine', 'database', 'VCN', 'compartment'.",
-      inputSchema: {
-        type: "object" as const,
-        properties: {
-          query: {
-            type: "string",
-            description: "Search query (matches against shape title and slug)",
-          },
-        },
-        required: ["query"],
       },
     },
     {
       name: "create_oci_diagram",
-      description:
-        "Create an OCI architecture diagram with official Oracle Cloud shapes. Returns a draw.io URL that opens the diagram with the OCI shape library loaded in the sidebar. Use slugs from list_oci_shapes or search_oci_shapes for the shape field. For grouping/container shapes, use the groups array. Coordinates are in pixels; typical spacing is 200px between nodes.",
+      description: `Build mxGraphModel XML from nodes, connections, groups. Returns draw.io URL with OCI library loaded.
+
+Prereq: call \`list_oci_icons\` first (see server instructions).
+
+# Rules specific to this tool
+
+1. Use Cookbook coords below. Pre-computed tables cover ~80%. Formula for rest. Pass 0,0,0,0 → MCP falls back to ugly horizontal flow — avoid.
+2. \`component/expanded\` = GROUP only, with children. Never a node.
+3. \`component/{oci|onprem|3rdparty|atomic|composite}\` = NODE only, no children.
+4. One entity per container. Never node AND group for same thing.
+5. Overlapping groups MUST nest. B visually inside A → B in A.children.
+6. Parent groups BEFORE children in groups array.
+7. Physical subnets include CIDR: \`"Public Subnet\\n10.0.1.0/24"\`.
+8. No self-loops. from != to. "Access console" = from user/developer TO target.
+9. Every node connects OR belongs to a group. Orphans warn.
+10. OCI managed services INSIDE \`group/oracle_services_network\`: GenAI, Visual Builder, Digital Assistant, Object Storage, Autonomous DB, Functions, Integration, Analytics. IAM stays outside OSN (identity, not data).
+11. Callout nodes at ROOT level, never inside OSN. "Home page", "service console", "admin access" callouts = root-level nodes BELOW region, dashed arrow UP to target.
+
+# Layout Cookbook
+
+## Node sizes (fixed)
+- Icons: **44 × 56**
+- Component boxes: **110 × 40**
+
+## Pre-computed group sizes (use these — cover ~80% of cases)
+
+**ROW** (first child x=25 y=30):
+| N | kind | group w | group h | GAP | next.x |
+|---|------|---------|---------|-----|--------|
+| 2 | icon | 163 | 86 | 50 | 119 |
+| 3 | icon | 232 | 86 | 50 | 213 |
+| 4 | icon | 301 | 86 | 50 | 307 |
+| 2 | comp | 280 | 90 | 30 | 165 |
+| 3 | comp | 420 | 90 | 30 | 305 |
+
+**COLUMN** (first x=25 y=30):
+| N | kind | group w | group h | GAP | next.y |
+|---|------|---------|---------|-----|--------|
+| 2 | icon | 94 | 212 | 70 | 156 |
+| 3 | icon | 94 | 338 | 70 | 282 |
+| 2 | comp | 160 | 140 | 50 | 120 |
+| 3 | comp | 160 | 220 | 50 | 210 |
+
+**Nested** (parent = 2 sub-groups side-by-side, each col):
+| sub layout | sub w×h | parent w | parent h |
+|------------|---------|----------|----------|
+| 2×(2 icon col) | 94×212 | 258 | 272 |
+| 2×(3 comp col) | 160×220 | 390 | 280 |
+| 2×(1 icon + 2 comp) | 160×192 | 390 | 252 |
+
+## Formula (for cases not in table)
+\`\`\`
+ROW: w = 50 + N·child_w + (N-1)·GAP;  h = 50 + max_child_h
+COL: w = 50 + max_child_w;             h = 50 + N·child_h + (N-1)·GAP
+GAP: icon row 50, icon col 70, comp row 30, comp col 50
+\`\`\`
+
+## Child positions (rel to parent)
+\`\`\`
+first: x=25, y=30
+row: next.x = prev.x + prev.w + GAP;  y=30
+col: x=25;  next.y = prev.y + prev.h + GAP
+\`\`\`
+
+## Root-level gaps
+- 60px min between root groups/callouts.
+
+## Cascade buffer — CRITICAL
+Parents can auto-grow +60px. Callouts below region → **y = region.y + region.h + 60**. Not +10, not +20. Example: region (20,h=280) → callouts at y=360.
+
+## Template A — canonical logical (copy-paste)
+
+\`\`\`
+// ROOT
+Internet    group (x=20,  y=20,  w=94,  h=212) children=[users, developer]
+OCI Region  group (x=180, y=20,  w=720, h=280) children=[iam, osn]
+vb_home     node  (x=220, y=360) icon developer_services/visual_builder
+oda_console node  (x=380, y=360) icon analytics_and_ai/digital_assistant
+llm_apis    node  (x=720, y=360) icon analytics_and_ai/artificial_intelligence
+
+// Internet (2-icon col)
+users     (25, 30)
+developer (25, 156)
+
+// OCI Region
+iam (25, 30)
+osn sub-group (95, 20, 580×240) children=[vb_group, oda_group]
+// genai goes INSIDE osn (rule #13) — add as 3rd sub-group or replace layout
+
+// OSN (2 sub-groups row)
+vb_group  (25,  30, 160×192) children=[vb_app, vb_db]
+oda_group (215, 30, 160×192) children=[channel, skill, rest_api]
+
+// vb_group (2-icon col)
+vb_app (25, 30)    developer_services/visual_builder
+vb_db  (25, 106)   database/autonomous_db
+
+// oda_group (3-icon col)
+channel  (25, 30)    analytics_and_ai/digital_assistant
+skill    (25, 106)   reuse digital_assistant (rule #2)
+rest_api (25, 182)   developer_services/api_service
+\`\`\`
+
+## Template B — pipeline (flat columns)
+\`\`\`
+Col1 (20, 20, 100×300) | Col2 (140, 20, 100×300) | Col3 (260, 20, 100×300)
+// 20px gap; icons at y=30, y=150 inside each
+\`\`\`
+
+## Template C — physical VCN
+\`\`\`
+Region (20, 20, 600×420)
+  Compartment (25, 30, 550×380)
+    VCN (25, 40, 500×320)
+      Public Subnet  (25, 50,  450×100)
+      Private Subnet (25, 180, 450×100)
+\`\`\`
+
+# Nesting limits
+- Pipeline: no nesting
+- Physical: Region→Compartment→[AD→FD→]VCN→Subnet (3-5 levels)
+- Logical: Location → expanded/other_group (max 2)
+- Target 10-20 components. >25 → split.
+
+# Shape references
+
+**Grouping shapes** (groups[].shape):
+- Physical: \`physical/grouping_{oci_region|compartment|vcn|subnet|availability_domain|tenancy|fault_domain|user_group|tier}\`, \`group/{metro_realm|on_premises|oracle_services_network}\`
+- Logical: \`logical/grouping_{oracle_cloud|on_premises|internet|3rd_party_cloud|other_group}\`, \`component/expanded\`
+- Any: \`group/optional\`
+
+**Component boxes** (nodes[].shape): \`component/{oci|onprem|3rdparty|atomic|composite}\`. Last-resort only (prefer icons — see server instructions).
+
+**Special connectors** (physical hybrid):
+- FastConnect: \`physical/special_connectors_fastconnect_{vertical|horizontal}\`
+- S2S VPN: \`physical/special_connectors_site_to_site_vpn_vertical\`
+- Remote Peering: \`physical/special_connectors_remote_peering_{vertical|horizontal}\`
+
+# Connector style
+
+\`style\`: \`solid\` (dataflow, default) or \`dashed\` (user interaction). Physical diagrams = solid only. \`label\`: 8pt, short 1-2 words, omit when obvious.`,
       inputSchema: {
         type: "object" as const,
         properties: {
           nodes: {
             type: "array",
-            description: "Nodes (shapes) to place on the diagram",
+            description: "Nodes (icon shapes) to place. Coordinates are relative to parent group. At default scale (0.5), each icon occupies ~42×65px.",
             items: {
               type: "object" as const,
               properties: {
@@ -70,52 +241,73 @@ export function getOciToolDefinitions(): object[] {
                 shape: {
                   type: "string",
                   description:
-                    "Shape slug (e.g. 'compute/virtual_machine_vm') or search term (e.g. 'load balancer')",
+                    "Icon slug (e.g. 'compute/virtual_machine_vm') or component box ('component/oci', 'component/onprem', 'component/3rdparty', 'component/atomic', 'component/composite'). NOT component/expanded — that goes in groups array.",
                 },
                 label: { type: "string", description: "Display label for the shape" },
-                x: { type: "number", description: "X position in pixels" },
-                y: { type: "number", description: "Y position in pixels" },
+                x: { type: "number", description: "X position in pixels relative to parent group. Use 25 for the first child; for row layout next child x = prev.x + prev.w + GAP." },
+                y: { type: "number", description: "Y position in pixels relative to parent group. Use 30 for the first row; for column layout next child y = prev.y + prev.h + GAP." },
               },
-              required: ["id", "shape", "label", "x", "y"],
+              required: ["id", "shape", "label"],
             },
           },
           connections: {
             type: "array",
-            description: "Connections (edges) between nodes",
+            description: "Connections (edges) between nodes. Rendered as orthogonal lines with open arrowheads, 1pt stroke, 8pt labels in Bark color. Labels get Air background fill.",
             items: {
               type: "object" as const,
               properties: {
                 from: { type: "string", description: "Source node ID" },
                 to: { type: "string", description: "Target node ID" },
-                label: { type: "string", description: "Optional edge label" },
+                label: {
+                  type: "string",
+                  description: "Descriptive text only (8pt, Bark, Air background). Do NOT embed step numbers here — use the `step` field instead.",
+                },
+                style: {
+                  type: "string",
+                  enum: ["solid", "dashed"],
+                  description: "Connector style: 'solid' (default) = Dataflow, 'dashed' = User Interaction",
+                },
+                step: {
+                  type: "integer",
+                  minimum: 1,
+                  description: "OPT-IN ONLY. Use ONLY when the user explicitly numbers this specific connection (e.g. user's description says '1 Authentication'). Do NOT add step to connections the user didn't number. Default = omit. When set, renders a Sienna (#AE562C) numbered circle.",
+                },
+                note: {
+                  type: "string",
+                  description: "OPT-IN ONLY. Use ONLY when the user explicitly asks for lettered footnotes (e.g. 'mark with A, B, C'). Default = omit. When set, renders a Neutral 4 (#6B6560) lettered circle.",
+                },
               },
               required: ["from", "to"],
             },
           },
           groups: {
             type: "array",
-            description: "Container/grouping shapes (e.g. VCN, Compartment, Region). Child nodes use relative coordinates.",
+            description: "Container groups (with children). Parents BEFORE children in array. component/expanded goes HERE (not in nodes). Overlapping groups must be nested via children.",
             items: {
               type: "object" as const,
               properties: {
                 id: { type: "string", description: "Unique group identifier" },
                 shape: {
                   type: "string",
-                  description: "Shape slug for grouping shape (e.g. 'physical/grouping_vcn')",
+                  description: "Shape slug for grouping shape (e.g. 'physical/grouping_vcn'), or generated group type ('component/expanded', 'group/metro_realm', 'group/optional')",
                 },
                 label: { type: "string", description: "Display label" },
-                x: { type: "number", description: "X position in pixels" },
-                y: { type: "number", description: "Y position in pixels" },
-                w: { type: "number", description: "Width in pixels" },
-                h: { type: "number", description: "Height in pixels" },
+                x: { type: "number", description: "X position in pixels relative to parent group (or absolute if root-level). Use the Cookbook formula." },
+                y: { type: "number", description: "Y position in pixels relative to parent group (or absolute if root-level). Use the Cookbook formula." },
+                w: { type: "number", description: "Width in pixels. Formula: 50 + N×child_w + (N-1)×GAP for a row of N children. The MCP auto-grows if you undersize." },
+                h: { type: "number", description: "Height in pixels. Formula: 50 + max_child_h for a single row, or 50 + N×child_h + (N-1)×GAP for a column." },
                 children: {
                   type: "array",
                   items: { type: "string" },
-                  description: "IDs of nodes contained in this group",
+                  description: "IDs of nodes or sub-groups contained in this group. REQUIRED for any non-leaf group.",
                 },
               },
-              required: ["id", "shape", "label", "x", "y", "w", "h"],
+              required: ["id", "shape", "label"],
             },
+          },
+          scale: {
+            type: "number",
+            description: "Icon scale factor (default 0.5 = half size). At 0.5, icons are ~42×65px. At 1.0, icons are ~84×130px.",
           },
         },
         required: ["nodes"],
@@ -125,16 +317,14 @@ export function getOciToolDefinitions(): object[] {
 }
 
 /** Handle an OCI tool call. Returns the JSON-RPC result content. */
-export function handleOciTool(
+export async function handleOciTool(
   toolName: OciToolName,
   args: Record<string, unknown>,
   port: string | number,
-): { content: { type: string; text: string }[] } {
+): Promise<{ content: { type: string; text: string }[] }> {
   switch (toolName) {
-    case "list_oci_shapes":
+    case "list_oci_icons":
       return handleListShapes(args);
-    case "search_oci_shapes":
-      return handleSearchShapes(args);
     case "create_oci_diagram":
       return handleCreateDiagram(args, port);
   }
@@ -143,85 +333,76 @@ export function handleOciTool(
 function handleListShapes(args: Record<string, unknown>): {
   content: { type: string; text: string }[];
 } {
-  const category = args.category as string | undefined;
+  const raw = args.category;
+  const categories: string[] = Array.isArray(raw)
+    ? (raw as string[]).map(String).filter((c) => c.trim())
+    : typeof raw === "string" && raw.trim()
+      ? [raw]
+      : [];
 
-  if (!category) {
-    // Return categories with counts
-    const cats = getCategories();
-    const text = cats.map((c) => `${c.name} (${c.count} shapes)`).join("\n");
+  // Filter out non-icon shapes: grouping containers, templates, examples, special connectors.
+  // These are either already documented in create_oci_diagram or are reference layouts not usable as nodes.
+  const EXCLUDED_PREFIXES = ["grouping_", "templates_", "example_", "special_connectors_", "components_", "component_", "connectors_", "connector_", "connector", "location_canvas_"];
+  const EXCLUDED_CATEGORIES = new Set(["Physical", "Logical"]);
+  const isIcon = (slug: string, category: string): boolean => {
+    if (EXCLUDED_CATEGORIES.has(category)) return false;
+    const name = slug.split("/")[1] || "";
+    return name !== "" && !EXCLUDED_PREFIXES.some((p) => name.startsWith(p));
+  };
+
+  if (categories.length === 0) {
+    // Return categories with icon counts only
+    const allShapes = listShapes();
+    const iconCounts = new Map<string, number>();
+    for (const s of allShapes) {
+      if (isIcon(s.slug, s.category)) {
+        iconCounts.set(s.category, (iconCounts.get(s.category) || 0) + 1);
+      }
+    }
+    const text = [...iconCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .filter(([, count]) => count > 0)
+      .map(([name, count]) => `${name} (${count} icons)`)
+      .join("\n");
     return {
       content: [
         {
           type: "text",
-          text: `OCI Shape Categories:\n\n${text}\n\nUse list_oci_shapes with a category name to see individual shapes.`,
+          text: `OCI Icon Categories:\n\n${text}\n\nPass all needed categories as an array to see icons.`,
         },
       ],
     };
   }
 
-  const shapes = listShapes(category);
-  if (shapes.length === 0) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `No shapes found in category "${category}". Use list_oci_shapes without a category to see available categories.`,
-        },
-      ],
-    };
+  const sections: string[] = [];
+  for (const category of categories) {
+    const shapes = listShapes(category).filter((s) => isIcon(s.slug, s.category));
+    if (shapes.length === 0) {
+      sections.push(`## "${category}" — no icon shapes found`);
+    } else {
+      const lines = shapes.map((s) => `- ${s.slug} — ${s.name} (${s.w}×${s.h})`);
+      sections.push(`## ${category} (${shapes.length} shapes)\n${lines.join("\n")}`);
+    }
   }
 
-  const lines = shapes.map((s) => `- ${s.slug} — ${s.name} (${s.w}×${s.h})`);
   return {
     content: [
       {
         type: "text",
-        text: `${category} shapes (${shapes.length}):\n\n${lines.join("\n")}`,
+        text: sections.join("\n\n"),
       },
     ],
   };
 }
 
-function handleSearchShapes(args: Record<string, unknown>): {
-  content: { type: string; text: string }[];
-} {
-  const query = (args.query as string) || "";
-  if (!query.trim()) {
-    return {
-      content: [{ type: "text", text: "Please provide a search query." }],
-    };
-  }
-
-  const results = searchShapes(query);
-  if (results.length === 0) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `No shapes found for "${query}". Try broader terms or use list_oci_shapes to browse categories.`,
-        },
-      ],
-    };
-  }
-
-  const lines = results.map((s) => `- ${s.slug} — ${s.title} (${s.w}×${s.h})`);
-  return {
-    content: [
-      {
-        type: "text",
-        text: `Found ${results.length} shape(s) for "${query}":\n\n${lines.join("\n")}\n\nUse the slug in create_oci_diagram's shape field.`,
-      },
-    ],
-  };
-}
-
-function handleCreateDiagram(
+async function handleCreateDiagram(
   args: Record<string, unknown>,
   port: string | number,
-): { content: { type: string; text: string }[] } {
+): Promise<{ content: { type: string; text: string }[] }> {
   const nodes = (args.nodes || []) as DiagramNode[];
   const connections = (args.connections || []) as DiagramConnection[];
   const groups = (args.groups || []) as DiagramGroup[];
+  const scale = (args.scale as number | undefined) ?? undefined;
 
   if (nodes.length === 0) {
     return {
@@ -229,13 +410,44 @@ function handleCreateDiagram(
     };
   }
 
-  const result = buildDiagram(nodes, connections, groups);
+  const t0 = Date.now();
+  const result = buildDiagram(nodes, connections, groups, scale);
+  const buildMs = Date.now() - t0;
 
-  // Build draw.io URL with the diagram XML
-  const encodedXml = encodeURIComponent(result.xml);
+  // Upload diagram XML to OCI Object Storage (HTTPS) and return a short URL.
+  // draw.io loads the XML from the HTTPS PAR URL (no mixed content issues).
+  const diagramId = randomUUID().slice(0, 8);
+  const parBase = getDiagramParBaseUrl();
+  const objectName = `diagrams/${diagramId}.xml`;
+  const uploadUrl = `${parBase}${objectName}`;
+
+  // Upload via HTTP PUT to PAR URL
+  const t1 = Date.now();
+  try {
+    const uploadRes = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { "Content-Type": "application/xml" },
+      body: result.xml,
+    });
+    if (!uploadRes.ok) {
+      throw new Error(`Upload failed: ${uploadRes.status} ${uploadRes.statusText}`);
+    }
+  } catch (err) {
+    // Fallback: return inline XML if upload fails
+    const errMsg = err instanceof Error ? err.message : "Unknown error";
+    console.error(`[DIAGRAM] build=${buildMs}ms upload=FAILED (${errMsg}) xml=${result.xml.length}b nodes=${nodes.length} groups=${groups.length}`);
+    return {
+      content: [{ type: "text", text: `Error uploading diagram: ${errMsg}\n\nRaw XML (copy to draw.io):\n${result.xml.substring(0, 500)}...` }],
+    };
+  }
+  const uploadMs = Date.now() - t1;
+  console.log(`[DIAGRAM] build=${buildMs}ms upload=${uploadMs}ms xml=${result.xml.length}b nodes=${nodes.length} groups=${groups.length} errors=${result.errors.length}`);
+
+  const diagramUrl = uploadUrl;
   const libraryUrl = getLibraryBaseUrl(port);
   const encodedLibUrl = encodeURIComponent(libraryUrl);
-  const url = `https://app.diagrams.net/?clibs=U${encodedLibUrl}#R${encodedXml}`;
+  const encodedDiagramUrl = encodeURIComponent(diagramUrl);
+  const url = `https://app.diagrams.net/?dark=0&clibs=U${encodedLibUrl}#U${encodedDiagramUrl}`;
 
   let text = `OCI Architecture Diagram created.\n\nOpen in draw.io:\n${url}`;
   if (result.errors.length > 0) {

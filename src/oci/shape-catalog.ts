@@ -16,11 +16,13 @@ export interface CatalogEntry {
 }
 
 let catalog: CatalogEntry[] | null = null;
+let slugIndex: Map<string, CatalogEntry> | null = null;
 
 function loadCatalog(): CatalogEntry[] {
   if (!catalog) {
     const raw = fs.readFileSync(path.join(dataDir, "oci-catalog.json"), "utf8");
     catalog = JSON.parse(raw) as CatalogEntry[];
+    slugIndex = new Map(catalog.map((e) => [e.slug, e]));
   }
   return catalog;
 }
@@ -58,6 +60,6 @@ export function getShapeById(id: number): CatalogEntry | undefined {
 }
 
 export function getShapeBySlug(slug: string): CatalogEntry | undefined {
-  const entries = loadCatalog();
-  return entries.find((e) => e.slug === slug);
+  loadCatalog();
+  return slugIndex!.get(slug);
 }

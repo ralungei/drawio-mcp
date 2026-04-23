@@ -6,7 +6,7 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 
 import { ensureMcpProcess, sendToMcp, killMcpProcess } from "./mcp-bridge.js";
-import { serveLibrary, isOciTool, handleOciTool, getOciToolDefinitions, type OciToolName } from "./oci/index.js";
+import { serveLibrary, isOciTool, handleOciTool, getOciToolDefinitions, getServerInstructions, type OciToolName } from "./oci/index.js";
 import { rewriteDrawioUrls, getLibraryBaseUrl } from "./url-rewriter.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,10 +57,31 @@ function interceptToolsList(responseJson: string): string {
 }
 
 /**
+ * Intercept initialize responses: inject/merge OCI server instructions.
+ * Per MCP spec, the initialize result may carry an `instructions` field
+ * (a server-level hint read as system context by clients).
+ */
+function interceptInitialize(responseJson: string): string {
+  try {
+    const msg = JSON.parse(responseJson);
+    if (msg.result && typeof msg.result === "object") {
+      const existing = typeof msg.result.instructions === "string" ? msg.result.instructions : "";
+      msg.result.instructions = existing
+        ? `${existing}\n\n${getServerInstructions()}`
+        : getServerInstructions();
+      return JSON.stringify(msg);
+    }
+  } catch {
+    // Not valid JSON or unexpected shape — return as-is
+  }
+  return responseJson;
+}
+
+/**
  * Handle an OCI tool call locally. Returns JSON-RPC response string.
  */
-function handleOciToolCall(id: unknown, toolName: OciToolName, args: Record<string, unknown>): string {
-  const result = handleOciTool(toolName, args, config.port);
+async function handleOciToolCall(id: unknown, toolName: OciToolName, args: Record<string, unknown>): Promise<string> {
+  const result = await handleOciTool(toolName, args, config.port);
   return JSON.stringify({
     jsonrpc: "2.0",
     id,
@@ -122,14 +143,18 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   if (url.pathname === "/mcp" && req.method === "POST") {
     const body = await readBody(req);
     const { method, id, params } = parseJsonRpc(body);
+    const t0 = Date.now();
+    const toolName = method === "tools/call" && params ? (params.name as string) : undefined;
+    const logTag = toolName ? `${method}:${toolName}` : (method || "unknown");
+    console.log(`[REQ] ${logTag} id=${id}`);
 
     try {
       // Intercept tools/call for OCI tools
       if (method === "tools/call" && params) {
-        const toolName = params.name as string;
-        if (isOciTool(toolName)) {
+        if (toolName && isOciTool(toolName)) {
           const args = (params.arguments || {}) as Record<string, unknown>;
-          const response = handleOciToolCall(id, toolName, args);
+          const response = await handleOciToolCall(id, toolName, args);
+          console.log(`[RES] ${logTag} ${Date.now() - t0}ms ok (${response.length}b)`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(response);
           return;
@@ -140,6 +165,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       let response = await sendToMcp(body, projectRoot);
 
       if (!response) {
+        console.log(`[RES] ${logTag} ${Date.now() - t0}ms 204`);
         res.writeHead(204);
         res.end();
         return;
@@ -150,14 +176,21 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         response = interceptToolsList(response);
       }
 
+      // Intercept initialize: inject server-level instructions
+      if (method === "initialize") {
+        response = interceptInitialize(response);
+      }
+
       // Rewrite draw.io URLs to include clibs
       const libraryUrl = getLibraryBaseUrl(config.port);
       response = rewriteDrawioUrls(response, libraryUrl);
 
+      console.log(`[RES] ${logTag} ${Date.now() - t0}ms ok (${response.length}b)`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(response);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+      console.error(`[ERR] ${logTag} ${Date.now() - t0}ms ${message}`);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message }, id: null }));
     }
