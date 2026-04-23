@@ -91,125 +91,57 @@ export function getOciToolDefinitions(): object[] {
 
 Prereq: call \`list_oci_icons\` first (see server instructions).
 
+# How to use: declarative layout (strongly recommended)
+
+Declare STRUCTURE — MCP computes all pixel coords:
+- Every group: \`layout\` = \`"row"\` (children side by side), \`"column"\` (stacked), or \`"grid"\` (wraps).
+- Every node and group: OMIT \`x\`, \`y\`, \`w\`, \`h\`. MCP sizes and positions everything.
+
+Example — OCI Generative AI + Digital Assistant + Visual Builder:
+\`\`\`json
+{
+  "nodes": [
+    { "id": "users",    "shape": "identity_and_security/user_group", "label": "Users" },
+    { "id": "dev",      "shape": "identity_and_security/user_1",     "label": "Developer" },
+    { "id": "iam",      "shape": "identity_and_security/iam_identity_and_access_management", "label": "IAM" },
+    { "id": "vb_app",   "shape": "developer_services/visual_builder",  "label": "VB Application" },
+    { "id": "vb_db",    "shape": "database/autonomous_db",             "label": "Built-in DB" },
+    { "id": "channel",  "shape": "analytics_and_ai/digital_assistant", "label": "Channel" },
+    { "id": "skill",    "shape": "analytics_and_ai/digital_assistant", "label": "Skill" },
+    { "id": "rest",     "shape": "developer_services/api_service",     "label": "REST API" },
+    { "id": "genai",    "shape": "analytics_and_ai/artificial_intelligence", "label": "OCI GenAI" }
+  ],
+  "groups": [
+    { "id": "internet", "shape": "logical/grouping_internet",   "label": "Internet",    "layout": "column", "children": ["users", "dev"] },
+    { "id": "region",   "shape": "physical/grouping_oci_region","label": "OCI Region",  "layout": "row",    "children": ["iam", "osn"] },
+    { "id": "osn",      "shape": "group/oracle_services_network","label": "OSN",        "layout": "row",    "children": ["vb_grp", "oda_grp", "genai"] },
+    { "id": "vb_grp",   "shape": "component/expanded",          "label": "Visual Builder","layout": "column", "children": ["vb_app", "vb_db"] },
+    { "id": "oda_grp",  "shape": "component/expanded",          "label": "Digital Assistant","layout": "column", "children": ["channel", "skill", "rest"] }
+  ]
+}
+\`\`\`
+The LLM's entire job: pick shapes, pick \`layout\` per group, declare children. Zero pixel math.
+
 # Rules specific to this tool
 
-1. Use Cookbook coords below. Pre-computed tables cover ~80%. Formula for rest. Pass 0,0,0,0 → MCP falls back to ugly horizontal flow — avoid.
-2. \`component/expanded\` = GROUP only, with children. Never a node.
-3. \`component/{oci|onprem|3rdparty|atomic|composite}\` = NODE only, no children.
-4. One entity per container. Never node AND group for same thing.
-5. Overlapping groups MUST nest. B visually inside A → B in A.children.
-6. Parent groups BEFORE children in groups array.
-7. Physical subnets include CIDR: \`"Public Subnet\\n10.0.1.0/24"\`.
-8. No self-loops. from != to. "Access console" = from user/developer TO target.
-9. Every node connects OR belongs to a group. Orphans warn.
-10. OCI managed services INSIDE \`group/oracle_services_network\`: GenAI, Visual Builder, Digital Assistant, Object Storage, Autonomous DB, Functions, Integration, Analytics. IAM stays outside OSN (identity, not data).
-11. Callout nodes at ROOT level, never inside OSN. "Home page", "service console", "admin access" callouts = root-level nodes BELOW region, dashed arrow UP to target.
+1. \`component/expanded\` = GROUP only, with children. Never a node.
+2. \`component/{oci|onprem|3rdparty|atomic|composite}\` = NODE only, no children.
+3. One entity per container. Never node AND group for same thing.
+4. Overlapping groups MUST nest. B visually inside A → B in A.children.
+5. Parent groups BEFORE children in groups array.
+6. Physical subnets include CIDR: \`"Public Subnet\\n10.0.1.0/24"\`.
+7. No self-loops. from != to. "Access console" = from user/developer TO target.
+8. Every node connects OR belongs to a group. Orphans warn.
+9. OCI managed services INSIDE \`group/oracle_services_network\`: GenAI, Visual Builder, Digital Assistant, Object Storage, Autonomous DB, Functions, Integration, Analytics. IAM stays outside OSN (identity, not data).
+10. Callout nodes at ROOT level, never inside OSN. "Home page", "service console", "admin access" callouts = root-level nodes (no parent group) with dashed arrow to target.
 
-# Layout Cookbook
+# Nesting patterns
 
-## Node sizes (fixed)
-- Icons: **44 × 56**
-- Component boxes: **110 × 40**
+- Logical (most common): Internet + Region as siblings; Region contains IAM + OSN + [callouts]; OSN contains sub-groups per service (VB, ODA) each with its own children.
+- Physical (infra): Region → Compartment → VCN → Subnet (optional AD/FD between Compartment and VCN for HA).
+- Pipeline (dataflow): flat root-level sibling groups, each a \`logical/grouping_other_group\` column of icons; edges flow L→R across columns.
 
-## Pre-computed group sizes (use these — cover ~80% of cases)
-
-**ROW** (first child x=25 y=30):
-| N | kind | group w | group h | GAP | next.x |
-|---|------|---------|---------|-----|--------|
-| 2 | icon | 163 | 86 | 50 | 119 |
-| 3 | icon | 232 | 86 | 50 | 213 |
-| 4 | icon | 301 | 86 | 50 | 307 |
-| 2 | comp | 280 | 90 | 30 | 165 |
-| 3 | comp | 420 | 90 | 30 | 305 |
-
-**COLUMN** (first x=25 y=30):
-| N | kind | group w | group h | GAP | next.y |
-|---|------|---------|---------|-----|--------|
-| 2 | icon | 94 | 212 | 70 | 156 |
-| 3 | icon | 94 | 338 | 70 | 282 |
-| 2 | comp | 160 | 140 | 50 | 120 |
-| 3 | comp | 160 | 220 | 50 | 210 |
-
-**Nested** (parent = 2 sub-groups side-by-side, each col):
-| sub layout | sub w×h | parent w | parent h |
-|------------|---------|----------|----------|
-| 2×(2 icon col) | 94×212 | 258 | 272 |
-| 2×(3 comp col) | 160×220 | 390 | 280 |
-| 2×(1 icon + 2 comp) | 160×192 | 390 | 252 |
-
-## Formula (for cases not in table)
-\`\`\`
-ROW: w = 50 + N·child_w + (N-1)·GAP;  h = 50 + max_child_h
-COL: w = 50 + max_child_w;             h = 50 + N·child_h + (N-1)·GAP
-GAP: icon row 50, icon col 70, comp row 30, comp col 50
-\`\`\`
-
-## Child positions (rel to parent)
-\`\`\`
-first: x=25, y=30
-row: next.x = prev.x + prev.w + GAP;  y=30
-col: x=25;  next.y = prev.y + prev.h + GAP
-\`\`\`
-
-## Root-level gaps
-- 60px min between root groups/callouts.
-
-## Cascade buffer — CRITICAL
-Parents can auto-grow +60px. Callouts below region → **y = region.y + region.h + 60**. Not +10, not +20. Example: region (20,h=280) → callouts at y=360.
-
-## Template A — canonical logical (copy-paste)
-
-\`\`\`
-// ROOT
-Internet    group (x=20,  y=20,  w=94,  h=212) children=[users, developer]
-OCI Region  group (x=180, y=20,  w=720, h=280) children=[iam, osn]
-vb_home     node  (x=220, y=360) icon developer_services/visual_builder
-oda_console node  (x=380, y=360) icon analytics_and_ai/digital_assistant
-llm_apis    node  (x=720, y=360) icon analytics_and_ai/artificial_intelligence
-
-// Internet (2-icon col)
-users     (25, 30)
-developer (25, 156)
-
-// OCI Region
-iam (25, 30)
-osn sub-group (95, 20, 580×240) children=[vb_group, oda_group]
-// genai goes INSIDE osn (rule #13) — add as 3rd sub-group or replace layout
-
-// OSN (2 sub-groups row)
-vb_group  (25,  30, 160×192) children=[vb_app, vb_db]
-oda_group (215, 30, 160×192) children=[channel, skill, rest_api]
-
-// vb_group (2-icon col)
-vb_app (25, 30)    developer_services/visual_builder
-vb_db  (25, 106)   database/autonomous_db
-
-// oda_group (3-icon col)
-channel  (25, 30)    analytics_and_ai/digital_assistant
-skill    (25, 106)   reuse digital_assistant (rule #2)
-rest_api (25, 182)   developer_services/api_service
-\`\`\`
-
-## Template B — pipeline (flat columns)
-\`\`\`
-Col1 (20, 20, 100×300) | Col2 (140, 20, 100×300) | Col3 (260, 20, 100×300)
-// 20px gap; icons at y=30, y=150 inside each
-\`\`\`
-
-## Template C — physical VCN
-\`\`\`
-Region (20, 20, 600×420)
-  Compartment (25, 30, 550×380)
-    VCN (25, 40, 500×320)
-      Public Subnet  (25, 50,  450×100)
-      Private Subnet (25, 180, 450×100)
-\`\`\`
-
-# Nesting limits
-- Pipeline: no nesting
-- Physical: Region→Compartment→[AD→FD→]VCN→Subnet (3-5 levels)
-- Logical: Location → expanded/other_group (max 2)
-- Target 10-20 components. >25 → split.
+Target 10-20 components. >25 → split diagrams.
 
 # Shape references
 
@@ -292,10 +224,15 @@ Region (20, 20, 600×420)
                   description: "Shape slug for grouping shape (e.g. 'physical/grouping_vcn'), or generated group type ('component/expanded', 'group/metro_realm', 'group/optional')",
                 },
                 label: { type: "string", description: "Display label" },
-                x: { type: "number", description: "X position in pixels relative to parent group (or absolute if root-level). Use the Cookbook formula." },
-                y: { type: "number", description: "Y position in pixels relative to parent group (or absolute if root-level). Use the Cookbook formula." },
-                w: { type: "number", description: "Width in pixels. Formula: 50 + N×child_w + (N-1)×GAP for a row of N children. The MCP auto-grows if you undersize." },
-                h: { type: "number", description: "Height in pixels. Formula: 50 + max_child_h for a single row, or 50 + N×child_h + (N-1)×GAP for a column." },
+                layout: {
+                  type: "string",
+                  enum: ["row", "column", "grid"],
+                  description: "RECOMMENDED. Layout intent for children: 'row' (side by side, e.g. VB + ODA inside OSN), 'column' (stacked, e.g. icons in an Internet group), 'grid' (approx square, wraps). When set, MCP computes all child positions and this group's w/h — omit x/y/w/h on this group and its descendants. Much easier than computing pixels manually.",
+                },
+                x: { type: "number", description: "X position (optional — omit when using `layout`)." },
+                y: { type: "number", description: "Y position (optional — omit when using `layout`)." },
+                w: { type: "number", description: "Width (optional — omit when using `layout`; MCP computes from children)." },
+                h: { type: "number", description: "Height (optional — omit when using `layout`; MCP computes from children)." },
                 children: {
                   type: "array",
                   items: { type: "string" },

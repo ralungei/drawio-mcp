@@ -13,6 +13,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as zlib from "zlib";
+import { applyDeclarativeLayout } from "./declarative-layout.js";
 import { fileURLToPath } from "url";
 import { getShapeBySlug, searchShapes, type CatalogEntry } from "./shape-catalog.js";
 
@@ -87,10 +88,19 @@ export interface DiagramConnection {
   note?: string;  // Unordered annotation (e.g. "A", "B") → Neutral 4 lettered circle
 }
 
+/** Layout intent for a group's children. MCP computes all pixel positions
+ *  from this directive + the children's intrinsic sizes. Overrides any
+ *  x/y passed on the children. */
+export type GroupLayout = "row" | "column" | "grid";
+
 export interface DiagramGroup {
   id: string;
   shape: string; // slug for a grouping shape
   label: string;
+  /** Layout directive for children. When set, MCP computes child positions
+   *  and this group's size automatically. When unset, falls back to legacy
+   *  imperative positioning (children's own x/y used). */
+  layout?: GroupLayout;
   x?: number;
   y?: number;
   w?: number;
@@ -2175,7 +2185,9 @@ function validateAndAutoSize(
   // 2) Value abuse: any single step number appearing on ≥5 connections is placeholder.
   //    (Legit duplicates across parallel paths usually max out at 2-3 occurrences.)
   const withStep = connections.filter(c => typeof c.step === "number" && c.step! > 0);
-  if (withStep.length > 0 && withStep.length / connections.length >= 0.9) {
+  // Only suspect bulk abuse when there are enough connections to reveal the pattern.
+  // ≤5 connections all with step = probably a legit numbered sequence.
+  if (connections.length > 5 && withStep.length / connections.length >= 0.9) {
     for (const c of connections) c.step = undefined;
     warnings.push(
       `${withStep.length}/${connections.length} connections had a step value — placeholder abuse. All dropped. Only pass "step" on user-numbered arrows (typically 3-5 per diagram).`,
@@ -2413,12 +2425,31 @@ export function buildDiagram(
     }
   }
 
-  // autoLayout is flat-only; skip it for nested structures (validateAndAutoSize handles those).
+  // Declarative layout: if ANY group carries a `layout` directive, the MCP
+  // computes every x/y/w/h from intent. Runs before autoLayout/validateAndAutoSize
+  // because it produces final coords — the rest just validates them.
+  const usedDeclarative = applyDeclarativeLayout(
+    nodes,
+    groups,
+    (id) => {
+      const n = nodes.find((nn) => nn.id === id);
+      if (n) return getDefaultNodeSize(n.shape);
+      return { w: MIN_GROUP_W, h: MIN_GROUP_H };
+    },
+    (id) => {
+      const n = nodes.find((nn) => nn.id === id);
+      if (!n) return "group";
+      return n.shape in COMPONENT_STYLES ? "component" : "icon";
+    },
+  );
+
+  // autoLayout (flat-only) only runs when no declarative hint is used and
+  // no nesting is present — validateAndAutoSize handles the rest.
   const groupIds = new Set(groups.map(g => g.id));
   const hasNestedGroups = groups.some(g => (g.children ?? []).some(cid => groupIds.has(cid)));
   const needsLayout = nodes.some(n => n.x === undefined || n.y === undefined)
     || groups.some(g => g.x === undefined || g.y === undefined);
-  if (needsLayout && !hasNestedGroups) {
+  if (!usedDeclarative && needsLayout && !hasNestedGroups) {
     autoLayout(nodes, connections, groups);
   }
 
