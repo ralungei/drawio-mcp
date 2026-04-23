@@ -1344,8 +1344,9 @@ function buildEdge(
   edgeOpacity: number,
   iconIds: Set<string>,
 ): string | null {
-  const sourceId = nodeAnchorMap.get(conn.from);
-  const targetId = nodeAnchorMap.get(conn.to);
+  // Endpoint can be a node OR a group. Check both maps.
+  const sourceId = nodeAnchorMap.get(conn.from) ?? groupCellMap.get(conn.from);
+  const targetId = nodeAnchorMap.get(conn.to) ?? groupCellMap.get(conn.to);
   if (!sourceId || !targetId) return null;
 
   const edgeId = `e_${idCounter.value++}`;
